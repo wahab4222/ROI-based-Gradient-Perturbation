@@ -38,7 +38,6 @@ ROI-Guided-Gradient-Perturbation/
 ├── CITATION.cff                  # Machine-readable citation metadata
 ├── LICENSE                       # MIT Open-Source License
 ├── figures/
-│   ├── fig1_fl_framework.png     # Federated perturbation setup diagram
 │   └── fig6_qualitative_maps.png # Grad-CAM feature attribution & noise scaling overlay
 ├── visualization/
 │   ├── generate_qualitative_visualization.py  # Script reproducing Figure 6
