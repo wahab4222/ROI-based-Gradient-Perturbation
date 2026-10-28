@@ -1,44 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Unified fast federated training script for OASIS / ADNI.
+Unified federated training script for OASIS / ADNI with heuristic gradient perturbation.
 
-This script is designed for the current Kaggle workflow:
-- one file
-- selectable dataset
-- selectable training mode
-- selectable backbone
-- fast enough for limited Kaggle quota
+Canonical experiment modes:
+    fed_nondp                       : FedAvg without gradient perturbation
+    uniform_perturbation            : uniform Gaussian gradient perturbation (legacy alias: fed_dp)
+    gradient_guided_perturbation    : gradient-importance-guided perturbation (legacy alias: roi_dp)
+    gradient_guided_perturbation_sa : same method plus secure-aggregation simulation flag (legacy alias: roi_dp_sa)
+    layer_adaptive_perturbation     : layer-wise gradient-importance-guided perturbation (legacy alias: adaptive_dp)
+    roi_layer_perturbation          : combined layer-adaptive + spatial/kernel guided perturbation (legacy alias: roi_layer_dp)
+    nondp_matched_scope             : no perturbation, matched trainable scope/configuration
 
-Implemented modes:
-    fed_nondp          : FedAvg, no DP, full trainable scope
-    fed_dp             : FedAvg + legacy manuscript-style uniform gradient-noise DP
-    roi_dp             : FedAvg + ROI-guided gradient-noise DP (IS_ROI=True)
-    roi_dp_sa          : ROI-DP + secure-aggregation simulation flag
-    nondp_matched_scope: FedAvg, no DP, but uses last_blocks scope + DP-matching
-                         transforms/LR to isolate the scope penalty from noise penalty
-
-Implemented backbones:
-    efficientnet_b2
-    inception_v3
-    swin_t
-
-Important privacy note:
-    This script uses a "legacy debug" gradient-noise implementation (privacy_accounting_status
-    = "legacy_debug_not_formal_dp"). It clips gradients and adds Gaussian noise before each
-    optimizer step, and logs epsilon values for reference only. These epsilon values are NOT
-    derived from a formal DP accountant (no Moments Accountant, no Opacus RDP) and must NOT
-    be cited as certified privacy guarantees. The noise levels used here (0.002, 0.0008) are
-    too small to achieve formal epsilon=3.8 at delta=1e-5; real DP at that budget would require
-    noise multiplier ~1.0-1.5, which collapsed to chance accuracy in earlier experiments.
-    For publishable DP guarantees, a future Opacus integration path is required.
-
-Kaggle examples:
-    !python /kaggle/working/unified_roi_dp_fast.py --dataset oasis --mode fed_dp --backbone efficientnet_b2
-    !python /kaggle/working/unified_roi_dp_fast.py --dataset oasis --mode roi_dp --backbone efficientnet_b2
-    !python /kaggle/working/unified_roi_dp_fast.py --dataset oasis --mode roi_dp_sa --backbone efficientnet_b2
-    !python /kaggle/working/unified_roi_dp_fast.py --dataset oasis --mode fed_nondp --backbone swin_t
-    !python /kaggle/working/unified_roi_dp_fast.py --dataset adni --mode fed_dp --backbone efficientnet_b2
+This implementation is a heuristic perturbation method and does NOT provide a formal differential-privacy
+guarantee. It does not use a formal DP accountant, and no certified epsilon/delta guarantee is claimed.
 """
 
 import argparse
@@ -88,14 +63,32 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 # ============================================================
 
 def parse_args():
-    p = argparse.ArgumentParser("Unified fast FL / DP / ROI-DP runner")
+    p = argparse.ArgumentParser("Unified federated training with heuristic gradient perturbation")
 
     p.add_argument("--dataset", required=True, choices=["oasis", "adni"])
-    p.add_argument("--mode", required=True,
-                   choices=["fed_nondp", "fed_dp", "roi_dp", "roi_dp_sa", "nondp_matched_scope", "adaptive_dp"])
+    p.add_argument(
+        "--mode",
+        required=True,
+        choices=[
+            "fed_nondp",
+            "uniform_perturbation",
+            "gradient_guided_perturbation",
+            "gradient_guided_perturbation_sa",
+            "layer_adaptive_perturbation",
+            "roi_layer_perturbation",
+            "nondp_matched_scope",
+            "fed_dp",
+            "roi_dp",
+            "roi_dp_sa",
+            "adaptive_dp",
+            "roi_layer_dp",
+        ],
+    )
     p.add_argument("--backbone", default="efficientnet_b2", choices=["efficientnet_b2", "inception_v3", "swin_t"])
 
     p.add_argument("--data_root", default=None, type=str)
+    p.add_argument("--output_root", default="/kaggle/working", type=str,
+                   help="Root folder for run outputs; runs are separated by seed.")
 
     p.add_argument("--clients", default=6, type=int)
     p.add_argument("--rounds", default=30, type=int)
@@ -106,16 +99,22 @@ def parse_args():
     p.add_argument("--eval_batch_size", default=64, type=int)
     p.add_argument("--num_workers", default=2, type=int)
 
-    p.add_argument("--target_epsilon", default=3.8, type=float)
-    p.add_argument("--delta", default=1e-5, type=float)
     p.add_argument("--max_grad_norm", default=1.0, type=float)
 
-    # Low-noise DP defaults based on previous manuscript-style implementation.
+    # Base perturbation amplitudes. For matched comparisons, pass identical values to both.
     p.add_argument("--uniform_noise_multiplier", default=0.0020, type=float)
-    p.add_argument("--roi_noise_multiplier", default=0.0008, type=float)
-    p.add_argument("--roi_critical_scale", default=0.05, type=float)
-    p.add_argument("--roi_average_scale", default=0.25, type=float)
-    p.add_argument("--roi_background_scale", default=1.0, type=float)
+    p.add_argument("--roi_noise_multiplier", default=0.0020, type=float)
+    p.add_argument("--roi_critical_scale", default=0.05, type=float,
+                   help="Relative scale assigned to high-gradient coordinates before normalization.")
+    p.add_argument("--roi_average_scale", default=0.25, type=float,
+                   help="Relative scale assigned to medium-gradient coordinates before normalization.")
+    p.add_argument("--roi_background_scale", default=1.0, type=float,
+                   help="Relative scale assigned to low-gradient coordinates before normalization.")
+    p.add_argument("--roi_beta", default=1.0, type=float,
+                   help="Spatial strength multiplier beta for roi_layer_perturbation.")
+    p.add_argument("--roi_noise_normalization", default="match_rms", choices=["match_rms", "legacy_scale"],
+                   help="match_rms normalizes each guided parameter tensor's noise scales to RMS=1, "
+                        "matching the uniform condition's expected per-element noise variance.")
 
     p.add_argument("--use_mixup", action="store_true", default=True)
     p.add_argument("--no_mixup", action="store_false", dest="use_mixup")
@@ -123,25 +122,23 @@ def parse_args():
 
     p.add_argument("--use_weighted_sampler", action="store_true", default=False)
     p.add_argument("--freeze_backbone_warmup", default=2, type=int)
-    p.add_argument("--dp_train_scope", default="last_blocks", choices=["head_only", "last_blocks", "full"])
+    p.add_argument("--train_scope", "--dp_train_scope", dest="train_scope", default="last_blocks",
+                   choices=["head_only", "last_blocks", "full"])
 
-    # CBAM attention: decoupled from IS_ROI so matched experiments can disable it.
-    # Default False so fed_dp and roi_dp use identical architectures unless explicitly requested.
+    # CBAM is disabled by default; matched conditions share the same architecture.
     p.add_argument("--use_cbam", action="store_true", default=False)
 
     p.add_argument("--no_mia", action="store_true")
     p.add_argument("--no_zip", action="store_true")
-    p.add_argument("--final_eval_mode", default="auto", choices=["auto", "base", "tta"],
-                   help="Final evaluation mode. 'auto' picks whichever scores higher on val "
-                        "(existing behaviour). 'base' or 'tta' force the choice — use for "
-                        "matched experiments so all runs are evaluated identically.")
+    p.add_argument("--final_eval_mode", default="base", choices=["auto", "base", "tta"],
+                   help="Use 'base' for matched comparisons; 'auto' chooses base/TTA using validation.")
+    p.add_argument("--selection_policy", default="validation_only",
+                   choices=["validation_only", "legacy_target"],
+                   help="validation_only selects the checkpoint with the best validation selection score.")
     p.add_argument("--matched_erasing_p", default=None, type=float,
-                   help="Override random erasing probability. Default None: 0.15 for DP/matched "
-                        "modes, 0.05 otherwise. Pass 0.05 for relaxed matched experiments.")
-    p.add_argument("--matched_lr_profile", default="auto", choices=["auto", "dp", "standard"],
-                   help="LR profile override. 'auto' = mode-based (DP/matched-scope use DP LRs). "
-                        "'standard' = head=5e-4, backbone=4e-5 for all modes. "
-                        "'dp' = head=3e-4, backbone=2e-5 for all modes.")
+                   help="Override random erasing probability so comparison arms share transforms.")
+    p.add_argument("--matched_lr_profile", default="auto", choices=["auto", "heuristic", "dp", "standard"],
+                   help="Learning-rate profile override; 'dp' is an alias for 'heuristic'.")
 
     return p.parse_args()
 
@@ -149,14 +146,30 @@ def parse_args():
 args = parse_args()
 
 DATASET_NAME = args.dataset.lower()
-MODE = args.mode.lower()
+_RAW_MODE = args.mode.lower()
+MODE_ALIASES = {
+    "fed_dp": "uniform_perturbation",
+    "roi_dp": "gradient_guided_perturbation",
+    "roi_dp_sa": "gradient_guided_perturbation_sa",
+    "adaptive_dp": "layer_adaptive_perturbation",
+    "roi_layer_dp": "roi_layer_perturbation",
+}
+MODE = MODE_ALIASES.get(_RAW_MODE, _RAW_MODE)
 BACKBONE = args.backbone.lower()
 
-IS_DP = MODE in ["fed_dp", "roi_dp", "roi_dp_sa", "adaptive_dp"]
-IS_ROI = MODE in ["roi_dp", "roi_dp_sa"]
-USE_SECURE_AGG = MODE == "roi_dp_sa"
-# nondp_matched_scope: no noise, but uses last_blocks scope + DP-matching transforms/LR.
-# Allows isolating the training-scope penalty from the noise penalty.
+IS_PERTURBATION = MODE in [
+    "uniform_perturbation",
+    "gradient_guided_perturbation",
+    "gradient_guided_perturbation_sa",
+    "layer_adaptive_perturbation",
+    "roi_layer_perturbation",
+]
+IS_ROI = MODE in [
+    "gradient_guided_perturbation",
+    "gradient_guided_perturbation_sa",
+    "roi_layer_perturbation",
+]
+USE_SECURE_AGG = MODE == "gradient_guided_perturbation_sa"
 IS_MATCHED_SCOPE = MODE == "nondp_matched_scope"
 
 SEED = args.seed
@@ -164,34 +177,27 @@ NUM_CLIENTS = args.clients
 ROUNDS = args.rounds
 LOCAL_EPOCHS = args.local_epochs
 
-TARGET_EPSILON = args.target_epsilon
-DELTA = args.delta
 MAX_GRAD_NORM = args.max_grad_norm
 
 UNIFORM_NOISE = args.uniform_noise_multiplier
 ROI_NOISE = args.roi_noise_multiplier
 
 # ── Config sanity warnings ──────────────────────────────────────────────────
-# Populated at startup, printed in the banner, and stored in experiment_summary.json.
-STARTUP_WARNINGS = []
-if IS_DP and args.use_cbam:
+STARTUP_WARNINGS = [
+    "Gradient perturbation is heuristic; no formal differential-privacy guarantee or certified epsilon is claimed."
+]
+if IS_PERTURBATION and args.use_cbam:
     STARTUP_WARNINGS.append(
-        "CBAM enabled for a DP mode — architecture differs from non-DP baseline "
-        "(confound). Pass --use_cbam only when intentionally testing CBAM's effect."
+        "CBAM changes the model architecture; use the same setting for every compared condition."
     )
 if IS_ROI and abs(ROI_NOISE - UNIFORM_NOISE) > 1e-9:
     STARTUP_WARNINGS.append(
-        f"roi_noise_multiplier ({ROI_NOISE}) != uniform_noise_multiplier ({UNIFORM_NOISE}). "
-        "Not a matched noise-budget comparison. For the matched debug experiment pass "
-        "--roi_noise_multiplier equal to --uniform_noise_multiplier."
+        f"The base multipliers differ ({ROI_NOISE} vs {UNIFORM_NOISE}); this is not a matched-strength run."
     )
-if IS_DP and args.dp_train_scope == "full":
+if IS_ROI and args.roi_noise_normalization != "match_rms":
     STARTUP_WARNINGS.append(
-        "Full-scope DP training without per-sample gradient clipping (Opacus) is NOT "
-        "formal DP. privacy_accounting_status = legacy_debug_not_formal_dp."
+        "Guided noise uses legacy, unnormalized relative scales; its overall perturbation strength may differ from uniform."
     )
-# No warning for nondp_matched_scope + dp_train_scope=full: that is the intended
-# full-scope matched comparison to isolate noise penalty from scope penalty.
 # ────────────────────────────────────────────────────────────────────────────
 
 RUN_MIA = not args.no_mia
@@ -212,8 +218,8 @@ def set_seed(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
 
 
 set_seed(SEED)
@@ -225,15 +231,6 @@ set_seed(SEED)
 
 def candidate_roots(dataset):
     if dataset == "oasis":
-        # New uploaded Kaggle OASIS 5400-image dataset.
-        # User-provided dataset root:
-        #   /kaggle/input/datasets/abdul10022/new-oasis
-        # In Kaggle it contains:
-        #   /kaggle/input/datasets/abdul10022/new-oasis/oasis/train
-        #   /kaggle/input/datasets/abdul10022/new-oasis/oasis/val
-        #   /kaggle/input/datasets/abdul10022/new-oasis/oasis/test
-        #
-        # Older paths are kept only as fallbacks.
         return [
             Path("/kaggle/input/datasets/abdul10022/new-oasis/oasis"),
             Path("/kaggle/input/datasets/abdul10022/new-oasis"),
@@ -258,7 +255,6 @@ def candidate_roots(dataset):
 
 
 def expand_dataset_roots(root_list, dataset_name):
-    """Accept either the exact folder containing train/val/test or a parent folder."""
     expanded = []
     seen = set()
 
@@ -297,21 +293,19 @@ TRAIN_DIR = DATA_ROOT / "train"
 VAL_DIR = DATA_ROOT / "val"
 TEST_DIR = DATA_ROOT / "test"
 
-# Include a source tag to avoid accidentally mixing old working-output checkpoints
-# with the newly uploaded OASIS dataset.
 data_root_text = str(DATA_ROOT).lower()
 if DATASET_NAME == "oasis" and ("new-oasis" in data_root_text or "new_oasis" in data_root_text):
     DATA_SOURCE_TAG = "new_oasis"
 else:
     DATA_SOURCE_TAG = DATASET_NAME
 
-OUT_DIR = Path(f"/kaggle/working/{DATA_SOURCE_TAG}_{BACKBONE}_{MODE}_{NUM_CLIENTS}clients_e{ROUNDS}")
+OUT_DIR = Path(args.output_root) / f"{DATA_SOURCE_TAG}_{BACKBONE}_{MODE}_{NUM_CLIENTS}clients_e{ROUNDS}_seed{SEED}"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 BEST_VAL_MODEL_PATH = OUT_DIR / "best_val_global_model.pt"
 BEST_TARGET_MODEL_PATH = OUT_DIR / "best_target_global_model.pt"
 TRAIN_LOG_PATH = OUT_DIR / "federated_training_log.csv"
-PRIVACY_LOG_PATH = OUT_DIR / "privacy_accounting.csv"
+PERTURBATION_LOG_PATH = OUT_DIR / "perturbation_diagnostics.csv"
 FINAL_METRICS_PATH = OUT_DIR / "final_metrics.csv"
 MIA_DIR = OUT_DIR / "membership_inference"
 MIA_DIR.mkdir(parents=True, exist_ok=True)
@@ -334,18 +328,16 @@ else:
 BATCH_SIZE = args.batch_size if args.batch_size else (32 if BACKBONE != "inception_v3" else 24)
 EVAL_BATCH_SIZE = args.eval_batch_size
 
-# LR profile: 'auto' applies DP-style LRs for IS_DP and IS_MATCHED_SCOPE, standard otherwise.
-# Override with --matched_lr_profile {dp,standard} to decouple from mode for relaxed experiments.
-_use_dp_lrs = (
-    args.matched_lr_profile == "dp"
-    or (args.matched_lr_profile == "auto" and (IS_DP or IS_MATCHED_SCOPE))
+_use_matched_lrs = (
+    args.matched_lr_profile in ["dp", "heuristic"]
+    or (args.matched_lr_profile == "auto" and (IS_PERTURBATION or IS_MATCHED_SCOPE))
 )
-if _use_dp_lrs:
+if _use_matched_lrs:
     HEAD_LR_WARMUP = 8e-4
     BACKBONE_LR = 2e-5
     HEAD_LR = 3e-4
     LABEL_SMOOTHING = 0.03
-    LR_PROFILE_LABEL = "dp"
+    LR_PROFILE_LABEL = "matched_perturbation"
 else:
     HEAD_LR_WARMUP = 1.2e-3
     BACKBONE_LR = 4e-5
@@ -360,16 +352,16 @@ USE_AMP = DEVICE.type == "cuda"
 ERASING_P = (
     args.matched_erasing_p
     if args.matched_erasing_p is not None
-    else (0.15 if (IS_DP or IS_MATCHED_SCOPE) else 0.05)
+    else (0.15 if (IS_PERTURBATION or IS_MATCHED_SCOPE) else 0.05)
 )
 
 print("============================================================")
-print("UNIFIED FAST FEDERATED TRAINING")
+print("UNIFIED FEDERATED TRAINING WITH HEURISTIC GRADIENT PERTURBATION")
 print("DATASET:", DATASET_NAME)
 print("MODE:", MODE)
 print("BACKBONE:", BACKBONE)
-print("IS_DP:", IS_DP)
-print("IS_ROI:", IS_ROI)
+print("Gradient perturbation enabled:", IS_PERTURBATION)
+print("Gradient-guided kernel allocation:", IS_ROI)
 print("IS_MATCHED_SCOPE:", IS_MATCHED_SCOPE)
 print("USE_CBAM:", args.use_cbam)
 print("SECURE_AGG_SIM:", USE_SECURE_AGG)
@@ -383,18 +375,19 @@ print("ROUNDS:", ROUNDS)
 print("LOCAL_EPOCHS:", LOCAL_EPOCHS)
 print("BATCH_SIZE:", BATCH_SIZE)
 print("IMG_SIZE:", IMG_SIZE)
-print("DP target epsilon:", TARGET_EPSILON if IS_DP else "N/A")
-print("privacy_accounting_status:", "legacy_debug_not_formal_dp" if IS_DP else "not_applicable")
-print("Uniform noise:", UNIFORM_NOISE if MODE == "fed_dp" else "N/A")
-print("ROI noise:", ROI_NOISE if IS_ROI else "N/A")
-print("Train scope:", args.dp_train_scope if (IS_DP or IS_MATCHED_SCOPE) else "full")
-print("Mixup:", args.use_mixup if (IS_DP or IS_MATCHED_SCOPE) else False)
+print("Privacy guarantee: NONE (heuristic perturbation; no formal DP accountant)")
+print("Uniform base multiplier:", UNIFORM_NOISE if MODE == "uniform_perturbation" else "N/A")
+print("Guided base multiplier:", ROI_NOISE if IS_ROI else "N/A")
+print("Guided scale normalization:", args.roi_noise_normalization if IS_ROI else "N/A")
+print("Train scope:", args.train_scope if (IS_PERTURBATION or IS_MATCHED_SCOPE) else "full")
+print("Mixup:", args.use_mixup if (IS_PERTURBATION or IS_MATCHED_SCOPE) else False)
 print("Random erasing p:", ERASING_P)
 print("LR profile:", LR_PROFILE_LABEL)
 print("Head LR (warmup):", HEAD_LR_WARMUP)
 print("Head LR (finetune):", HEAD_LR)
 print("Backbone LR:", BACKBONE_LR)
 print("Final eval mode (flag):", args.final_eval_mode)
+print("Checkpoint selection policy:", args.selection_policy)
 print("============================================================")
 if STARTUP_WARNINGS:
     print("\nCONFIG WARNINGS:")
@@ -404,7 +397,7 @@ if STARTUP_WARNINGS:
 
 
 # ============================================================
-# Robust dataset utilities
+# Dataset utilities
 # ============================================================
 
 def pil_rgb_loader(path):
@@ -428,17 +421,6 @@ class SafeImageFolderWithPaths(datasets.ImageFolder):
         try:
             img, label = super().__getitem__(index)
             return img, label, self.samples[index][0]
-        except Exception:
-            return None
-
-
-class SafeImageFolder(datasets.ImageFolder):
-    def __init__(self, root, transform=None, target_transform=None):
-        super().__init__(root, transform=transform, target_transform=target_transform, loader=pil_rgb_loader)
-
-    def __getitem__(self, index):
-        try:
-            return super().__getitem__(index)
         except Exception:
             return None
 
@@ -579,8 +561,10 @@ for cid, idxs in enumerate(client_indices):
     print(f"  Client {cid}: total={len(idxs)} | {dist}")
 
     subset = Subset(train_dataset, idxs)
-    sampler = make_weighted_sampler_for_subset(train_dataset, idxs) if args.use_weighted_sampler and not IS_DP else None
+    sampler = make_weighted_sampler_for_subset(train_dataset, idxs) if args.use_weighted_sampler and not IS_PERTURBATION else None
     _cuda = torch.cuda.is_available()
+    client_generator = torch.Generator()
+    client_generator.manual_seed(SEED + 10000 + cid)
     loader = DataLoader(
         subset,
         batch_size=BATCH_SIZE,
@@ -591,6 +575,7 @@ for cid, idxs in enumerate(client_indices):
         persistent_workers=(args.num_workers > 0 and _cuda),
         drop_last=False,
         collate_fn=safe_collate,
+        generator=client_generator,
     )
     client_loaders.append(loader)
 
@@ -606,25 +591,6 @@ test_loader = DataLoader(test_dataset, batch_size=EVAL_BATCH_SIZE, **_eval_dl_kw
 # ============================================================
 # Attention modules and model builders
 # ============================================================
-
-class SEBlock(nn.Module):
-    def __init__(self, channels, reduction=16):
-        super().__init__()
-        mid = max(1, channels // reduction)
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Sequential(
-            nn.Linear(channels, mid, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(mid, channels, bias=False),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, x):
-        b, c, _, _ = x.shape
-        y = self.avg_pool(x).view(b, c)
-        y = self.fc(y).view(b, c, 1, 1)
-        return x * y
-
 
 class EnhancedChannelAttention(nn.Module):
     def __init__(self, channels, ratio=16):
@@ -699,7 +665,6 @@ def build_model(pretrained=True, use_cbam=False, replace_bn=False):
         model.classifier = nn.Sequential(nn.Dropout(DROPOUT), nn.Linear(in_features, NUM_CLASSES))
 
         if use_cbam:
-            # last EfficientNet-B2 feature block outputs 1408 channels
             model.features[-1] = nn.Sequential(model.features[-1], EnhancedCBAM(1408))
 
     elif BACKBONE == "inception_v3":
@@ -741,26 +706,23 @@ def is_head_param(name):
 
 
 def configure_trainable(model, phase):
-    # Warmup: classifier/head only.
     if phase == "warmup":
         for name, p in model.named_parameters():
             p.requires_grad = is_head_param(name)
         return
 
-    # Full-scope only when: plain non-DP (not matched-scope) OR explicit full flag.
-    if ((not IS_DP) and (not IS_MATCHED_SCOPE)) or args.dp_train_scope == "full":
+    if ((not IS_PERTURBATION) and (not IS_MATCHED_SCOPE)) or args.train_scope == "full":
         for p in model.parameters():
             p.requires_grad = True
         return
 
-    # DP and nondp_matched_scope: train only head + final blocks.
     for p in model.parameters():
         p.requires_grad = False
 
     for name, p in model.named_parameters():
         if is_head_param(name):
             p.requires_grad = True
-        elif args.dp_train_scope == "last_blocks":
+        elif args.train_scope == "last_blocks":
             if BACKBONE == "efficientnet_b2" and ("features.7" in name or "features.8" in name):
                 p.requires_grad = True
             elif BACKBONE == "inception_v3" and ("Mixed_7" in name):
@@ -798,28 +760,30 @@ def make_optimizer(model, phase):
 
 
 # ============================================================
-# Noise / DP functions
+# Heuristic gradient perturbation & diagnostics
 # ============================================================
+
+NOISE_ALLOCATION_MAPS = {}
+NOISE_ALLOCATION_COUNTS = {}
+
+
+def _record_noise_map(param_name, noise_scale):
+    matrix = noise_scale.detach().float().mean(dim=1).squeeze(0)
+    if param_name not in NOISE_ALLOCATION_MAPS:
+        NOISE_ALLOCATION_MAPS[param_name] = matrix.clone()
+        NOISE_ALLOCATION_COUNTS[param_name] = 1
+    else:
+        NOISE_ALLOCATION_MAPS[param_name].add_(matrix)
+        NOISE_ALLOCATION_COUNTS[param_name] += 1
+
 
 @torch.no_grad()
 def _add_adaptive_gradient_noise(model, base_noise):
-    """Sensitivity-aware (global, per-layer) DP noise baseline  [Reviewer #1, C3].
-
-    Adaptive but NOT spatial. Each parameter tensor is perturbed with a noise
-    level scaled by its OWN global gradient magnitude relative to all layers:
-      - high-magnitude (task-informative) layers -> less noise (roi_critical_scale)
-      - low-magnitude layers                     -> more noise (roi_background_scale)
-
-    Same base multiplier, same per-parameter clipping, same scale range as
-    ROI-DP; the ONLY difference from roi_dp is allocation granularity (per-layer
-    scalar vs per-element spatial map), and from fed_dp is adaptive-vs-flat.
-    Heuristic; privacy validated empirically via MIA.
-    """
-    params = [p for p in model.parameters() if p.grad is not None]
-    if not params:
+    named_params = [(name, p) for name, p in model.named_parameters() if p.grad is not None]
+    if not named_params:
         return
     norms = []
-    for p in params:
+    for _, p in named_params:
         grad = p.grad.data
         gn = grad.norm()
         if gn > MAX_GRAD_NORM:
@@ -827,75 +791,91 @@ def _add_adaptive_gradient_noise(model, base_noise):
         norms.append(float(p.grad.data.norm().item()))
     lo, hi = min(norms), max(norms)
     span = (hi - lo) + 1e-12
-    for p, n in zip(params, norms):
-        s = (n - lo) / span  # [0,1]; higher => more sensitive / task-informative
-        scale = args.roi_background_scale + s * (args.roi_critical_scale - args.roi_background_scale)
-        p.grad.data.add_(torch.randn_like(p.grad.data) * (base_noise * MAX_GRAD_NORM * scale))
+    for (name, p), n in zip(named_params, norms):
+        s_norm = (n - lo) / span
+        raw_scale = args.roi_background_scale + s_norm * (args.roi_critical_scale - args.roi_background_scale)
+        p.grad.data.add_(torch.randn_like(p.grad.data) * (base_noise * MAX_GRAD_NORM * raw_scale))
 
 
 def add_gradient_noise(model, mode):
-    if not IS_DP:
+    if not IS_PERTURBATION:
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         return
 
-    if mode == "adaptive_dp":
+    torch.nn.utils.clip_grad_norm_(filter(lambda p: p.grad is not None, model.parameters()), max_norm=MAX_GRAD_NORM)
+
+    if mode == "layer_adaptive_perturbation":
         _add_adaptive_gradient_noise(model, ROI_NOISE)
         return
 
-    # Clip first.
-    torch.nn.utils.clip_grad_norm_(filter(lambda p: p.grad is not None, model.parameters()), max_norm=MAX_GRAD_NORM)
+    base_noise = UNIFORM_NOISE if mode == "uniform_perturbation" else ROI_NOISE
 
-    if mode == "fed_dp":
-        base_noise = UNIFORM_NOISE
-    else:
-        base_noise = ROI_NOISE
+    named_params = [(name, p) for name, p in model.named_parameters() if p.grad is not None]
+    if mode == "roi_layer_perturbation":
+        norms = [float(p.grad.data.norm().item()) for _, p in named_params]
+        lo, hi = min(norms), max(norms)
+        span = (hi - lo) + 1e-12
 
-    for p in model.parameters():
-        if p.grad is None:
-            continue
-
+    for param_name, p in named_params:
         grad = p.grad.data
 
-        if mode in ["roi_dp", "roi_dp_sa"] and grad.dim() == 4:
-            # ROI importance proxy from gradient magnitude, as in the previous repo approach.
-            importance = torch.mean(torch.abs(grad), dim=0, keepdim=True)
-            importance = F.interpolate(importance, size=grad.shape[2:], mode="bilinear", align_corners=False)
+        if mode == "roi_layer_perturbation":
+            # Combined layer sensitivity a_l + spatial ROI scaling
+            norm_val = float(grad.norm().item())
+            s_norm = (norm_val - lo) / span
+            a_l = args.roi_background_scale + s_norm * (args.roi_critical_scale - args.roi_background_scale)
+
+            if grad.dim() == 4:
+                importance = grad.detach().abs().mean(dim=0, keepdim=True)
+                mn, mx = importance.min(), importance.max()
+                if float((mx - mn).item()) > 1e-12:
+                    importance = (importance - mn) / (mx - mn + 1e-8)
+                else:
+                    importance = torch.zeros_like(importance)
+
+                # S_sp: higher importance -> lower perturbation
+                spatial_scale = (
+                    args.roi_background_scale
+                    - args.roi_beta * importance * (args.roi_background_scale - args.roi_critical_scale)
+                )
+                spatial_scale = torch.clamp(spatial_scale, 0.25, 2.5)
+                spatial_scale = spatial_scale / (spatial_scale.mean() + 1e-8)
+
+                effective_scale = a_l * spatial_scale
+                if args.roi_noise_normalization == "match_rms":
+                    scale_rms = torch.sqrt(torch.mean(effective_scale.square())).clamp_min(1e-12)
+                    effective_scale = effective_scale / scale_rms
+
+                _record_noise_map(param_name, effective_scale)
+                grad.add_(torch.randn_like(grad) * base_noise * MAX_GRAD_NORM * effective_scale)
+            else:
+                grad.add_(torch.randn_like(grad) * base_noise * MAX_GRAD_NORM * a_l)
+
+        elif mode in ["gradient_guided_perturbation", "gradient_guided_perturbation_sa"] and grad.dim() == 4:
+            importance = grad.detach().abs().mean(dim=0, keepdim=True)
             mn, mx = importance.min(), importance.max()
-            if mx > mn:
+            if float((mx - mn).item()) > 1e-12:
                 importance = (importance - mn) / (mx - mn + 1e-8)
             else:
                 importance = torch.zeros_like(importance)
 
-            critical = (importance > 0.80).float()
-            average = ((importance > 0.40) & (importance <= 0.80)).float()
-            background = (importance <= 0.40).float()
-
+            critical = (importance > 0.80).to(dtype=grad.dtype)
+            average = ((importance > 0.40) & (importance <= 0.80)).to(dtype=grad.dtype)
+            background = (importance <= 0.40).to(dtype=grad.dtype)
             noise_scale = (
                 critical * args.roi_critical_scale
                 + average * args.roi_average_scale
                 + background * args.roi_background_scale
             )
 
+            if args.roi_noise_normalization == "match_rms":
+                scale_rms = torch.sqrt(torch.mean(noise_scale.square())).clamp_min(1e-12)
+                noise_scale = noise_scale / scale_rms
+
+            _record_noise_map(param_name, noise_scale)
             grad.add_(torch.randn_like(grad) * base_noise * MAX_GRAD_NORM * noise_scale)
         else:
             grad.add_(torch.randn_like(grad) * base_noise * MAX_GRAD_NORM)
-
-
-def legacy_epsilon_values(round_id):
-    if not IS_DP:
-        return np.nan, np.nan, np.nan
-
-    progress = round_id / max(ROUNDS, 1)
-
-    if MODE == "fed_dp":
-        eps = TARGET_EPSILON * progress
-        return eps, eps, eps
-
-    # ROI-DP manuscript-style triplet. Conservative bound is epsilon_max.
-    eps_min_final = 0.90
-    eps_mean_final = 2.00
-    eps_max_final = min(3.04, TARGET_EPSILON)
-    return eps_min_final * progress, eps_mean_final * progress, eps_max_final * progress
 
 
 # ============================================================
@@ -1109,7 +1089,7 @@ def train_one_client(global_state, loader, round_id, client_id, phase):
 
             optimizer.zero_grad(set_to_none=True)
 
-            use_mix = (IS_DP or IS_MATCHED_SCOPE) and args.use_mixup and images.size(0) > 1
+            use_mix = (IS_PERTURBATION or IS_MATCHED_SCOPE) and args.use_mixup and images.size(0) > 1
             if use_mix:
                 images_m, ya, yb, lam = mixup_data(images, labels, args.mixup_alpha)
             else:
@@ -1179,7 +1159,6 @@ def fedavg(client_states, client_sizes):
 global_model = build_model(pretrained=True, use_cbam=args.use_cbam, replace_bn=False).to(DEVICE)
 global_state = OrderedDict((k, v.detach().cpu().clone()) for k, v in global_model.state_dict().items())
 
-# Count trainable params for the finetune phase so it's logged once at startup.
 configure_trainable(global_model, "finetune")
 TRAINABLE_PARAMS = sum(p.numel() for p in global_model.parameters() if p.requires_grad)
 TOTAL_PARAMS = sum(p.numel() for p in global_model.parameters())
@@ -1194,7 +1173,7 @@ best_target_score = -1e9
 best_val_round = -1
 best_target_round = -1
 history = []
-privacy_history = []
+perturbation_history = []
 
 start_time = time.time()
 
@@ -1234,23 +1213,19 @@ for rnd in range(1, ROUNDS + 1):
     val_m = collect_probs_loader(global_model, val_loader)
     val_score = selection_score(val_m)
 
-    eps_min, eps_mean, eps_max = legacy_epsilon_values(rnd)
-
-    if IS_DP:
-        privacy_row = {
+    if IS_PERTURBATION:
+        perturbation_row = {
             "round": rnd,
-            "epsilon_min": eps_min,
-            "epsilon_mean": eps_mean,
-            "epsilon_max": eps_max,
-            "target_epsilon": TARGET_EPSILON,
-            "delta": DELTA,
-            "uniform_noise_multiplier": UNIFORM_NOISE if MODE == "fed_dp" else np.nan,
-            "roi_noise_multiplier": ROI_NOISE if IS_ROI else np.nan,
-            "accounting": "legacy_debug_not_formal_dp",
-            "privacy_accounting_status": "legacy_debug_not_formal_dp",
+            "mode": MODE,
+            "base_noise_multiplier": UNIFORM_NOISE if MODE == "uniform_perturbation" else ROI_NOISE,
+            "uniform_noise_multiplier": UNIFORM_NOISE,
+            "guided_noise_multiplier": ROI_NOISE if IS_ROI else np.nan,
+            "guided_scale_normalization": args.roi_noise_normalization if IS_ROI else "not_applicable",
+            "formal_dp_guarantee": False,
+            "privacy_accounting_status": "no_formal_dp_accountant",
         }
-        privacy_history.append(privacy_row)
-        pd.DataFrame(privacy_history).to_csv(PRIVACY_LOG_PATH, index=False)
+        perturbation_history.append(perturbation_row)
+        pd.DataFrame(perturbation_history).to_csv(PERTURBATION_LOG_PATH, index=False)
 
     round_time = time.time() - round_start
 
@@ -1262,14 +1237,11 @@ for rnd in range(1, ROUNDS + 1):
         "phase": phase,
         "num_clients": NUM_CLIENTS,
         "local_epochs": LOCAL_EPOCHS,
-        "dp": IS_DP,
-        "roi_dp": IS_ROI,
-        "secure_aggregation": USE_SECURE_AGG,
-        "epsilon_min": eps_min,
-        "epsilon_mean": eps_mean,
-        "epsilon_max": eps_max,
-        "target_epsilon": TARGET_EPSILON if IS_DP else np.nan,
-        "delta": DELTA if IS_DP else np.nan,
+        "gradient_perturbation": IS_PERTURBATION,
+        "gradient_guided_kernel_allocation": IS_ROI,
+        "secure_aggregation_simulation": USE_SECURE_AGG,
+        "formal_dp_guarantee": False,
+        "privacy_accounting_status": "no_formal_dp_accountant" if IS_PERTURBATION else "not_applicable",
         "client_loss_mean": float(np.mean(client_losses)),
         "client_accuracy_mean": float(np.mean(client_accs)),
         "train_loss": train_m["loss"],
@@ -1292,8 +1264,8 @@ for rnd in range(1, ROUNDS + 1):
         f"val_acc={val_m['accuracy']:.4f} | val_f1={val_m['f1_macro']:.4f} | "
         f"val_auc={val_m['auc_macro_ovr']:.4f}"
     )
-    if IS_DP:
-        msg += f" | eps=({eps_min:.3f},{eps_mean:.3f},{eps_max:.3f})"
+    if IS_PERTURBATION:
+        msg += " | privacy_guarantee=none (heuristic perturbation)"
     msg += f" | time={round_time/60.0:.2f} min"
     print(msg)
 
@@ -1325,12 +1297,12 @@ print("=" * 80)
 # Final evaluation
 # ============================================================
 
-if BEST_TARGET_MODEL_PATH.exists():
+if args.selection_policy == "legacy_target" and BEST_TARGET_MODEL_PATH.exists():
     selected_path = BEST_TARGET_MODEL_PATH
-    selected_type = "best_target_train95_val85"
+    selected_type = "legacy_train95_val85_target_rule"
 else:
     selected_path = BEST_VAL_MODEL_PATH
-    selected_type = "best_validation"
+    selected_type = "best_validation_selection_score"
 
 final_model = build_model(pretrained=False, use_cbam=args.use_cbam, replace_bn=False).to(DEVICE)
 final_model.load_state_dict(torch.load(selected_path, map_location=DEVICE))
@@ -1536,8 +1508,6 @@ FPR: {best_mia['best_threshold_fpr']:.6f}
 # Final metrics CSV
 # ============================================================
 
-eps_min_final, eps_mean_final, eps_max_final = legacy_epsilon_values(ROUNDS)
-
 checks = {
     "train_image_accuracy_ge_95": final_train["accuracy"] >= 0.95,
     "val_image_accuracy_ge_85": final_val["accuracy"] >= 0.85,
@@ -1550,22 +1520,20 @@ final_summary = {
     "dataset": DATASET_NAME,
     "mode": MODE,
     "backbone": BACKBONE,
+    "seed": SEED,
+    "selection_policy": args.selection_policy,
     "num_clients": NUM_CLIENTS,
     "rounds": ROUNDS,
     "local_epochs": LOCAL_EPOCHS,
-    "dp": IS_DP,
-    "roi_dp": IS_ROI,
-    "secure_aggregation": USE_SECURE_AGG,
-    "privacy_accounting": "legacy_debug_not_formal_dp" if IS_DP else "none",
-    "privacy_accounting_status": "legacy_debug_not_formal_dp" if IS_DP else "not_applicable",
-    "target_epsilon": TARGET_EPSILON if IS_DP else np.nan,
-    "epsilon_min": eps_min_final,
-    "epsilon_mean": eps_mean_final,
-    "epsilon_max": eps_max_final,
-    "delta": DELTA if IS_DP else np.nan,
-    "uniform_noise_multiplier": UNIFORM_NOISE if MODE == "fed_dp" else np.nan,
-    "roi_noise_multiplier": ROI_NOISE if IS_ROI else np.nan,
-    "max_grad_norm": MAX_GRAD_NORM if IS_DP else np.nan,
+    "gradient_perturbation": IS_PERTURBATION,
+    "gradient_guided_kernel_allocation": IS_ROI,
+    "secure_aggregation_simulation": USE_SECURE_AGG,
+    "privacy_guarantee": "none_heuristic_gradient_perturbation" if IS_PERTURBATION else "not_applicable",
+    "privacy_accounting_status": "no_formal_dp_accountant" if IS_PERTURBATION else "not_applicable",
+    "uniform_noise_multiplier": UNIFORM_NOISE if MODE == "uniform_perturbation" else np.nan,
+    "guided_noise_multiplier": ROI_NOISE if IS_ROI else np.nan,
+    "guided_noise_normalization": args.roi_noise_normalization if IS_ROI else "not_applicable",
+    "max_grad_norm": MAX_GRAD_NORM if IS_PERTURBATION else np.nan,
     "selected_model_type": selected_type,
     "selected_model_path": str(selected_path),
     "best_val_round": best_val_round,
@@ -1621,27 +1589,28 @@ final_summary = {
 
 pd.DataFrame([final_summary]).to_csv(FINAL_METRICS_PATH, index=False)
 
-# experiment_summary.json — compact cross-run comparison file.
-# Contains only the key config fields and results needed to compare matched experiments.
-_effective_scope = args.dp_train_scope if (IS_DP or IS_MATCHED_SCOPE) else "full"
+_effective_scope = args.train_scope if (IS_PERTURBATION or IS_MATCHED_SCOPE) else "full"
 _exp_summary = {
     "dataset": DATASET_NAME,
     "mode": MODE,
     "backbone": BACKBONE,
     "effective_train_scope": _effective_scope,
     "use_cbam": args.use_cbam,
-    "use_mixup": args.use_mixup if (IS_DP or IS_MATCHED_SCOPE) else False,
+    "use_mixup": args.use_mixup if (IS_PERTURBATION or IS_MATCHED_SCOPE) else False,
     "random_erasing_p": ERASING_P,
     "lr_profile": LR_PROFILE_LABEL,
     "head_lr": HEAD_LR,
     "backbone_lr": BACKBONE_LR,
-    "is_dp": IS_DP,
-    "is_roi": IS_ROI,
+    "gradient_perturbation": IS_PERTURBATION,
+    "gradient_guided_kernel_allocation": IS_ROI,
     "is_matched_scope": IS_MATCHED_SCOPE,
-    "noise_multiplier": (UNIFORM_NOISE if MODE == "fed_dp" else
-                         ROI_NOISE if IS_ROI else None),
-    "noise_type": ("uniform" if MODE == "fed_dp" else
-                   "roi_weighted" if IS_ROI else "none"),
+    "base_noise_multiplier": (UNIFORM_NOISE if MODE == "uniform_perturbation" else
+                              ROI_NOISE if IS_ROI or MODE == "layer_adaptive_perturbation" else None),
+    "noise_allocation": ("uniform" if MODE == "uniform_perturbation" else
+                         "roi_layer_combined" if MODE == "roi_layer_perturbation" else
+                         "gradient_guided_kernel_parameter" if IS_ROI else
+                         "layer_adaptive" if MODE == "layer_adaptive_perturbation" else "none"),
+    "guided_noise_normalization": args.roi_noise_normalization if IS_ROI else "not_applicable",
     "rounds": ROUNDS,
     "local_epochs": LOCAL_EPOCHS,
     "clients": NUM_CLIENTS,
@@ -1650,7 +1619,8 @@ _exp_summary = {
     "trainable_params": TRAINABLE_PARAMS,
     "total_params": TOTAL_PARAMS,
     "trainable_params_pct": round(100.0 * TRAINABLE_PARAMS / TOTAL_PARAMS, 2),
-    "privacy_accounting_status": "legacy_debug_not_formal_dp" if IS_DP else "not_applicable",
+    "privacy_guarantee": "none_heuristic_gradient_perturbation" if IS_PERTURBATION else "not_applicable",
+    "privacy_accounting_status": "no_formal_dp_accountant" if IS_PERTURBATION else "not_applicable",
     "test_accuracy": float(final_test["accuracy"]),
     "test_auc_macro_ovr": float(final_test["auc_macro_ovr"]),
     "val_accuracy": float(final_val["accuracy"]),
@@ -1658,6 +1628,8 @@ _exp_summary = {
     "best_val_round": best_val_round,
     "final_eval_mode": final_eval_mode,
     "final_eval_mode_flag": args.final_eval_mode,
+    "selection_policy": args.selection_policy,
+    "roi_noise_normalization": args.roi_noise_normalization if IS_ROI else "not_applicable",
     "warnings": STARTUP_WARNINGS,
 }
 _exp_summary_path = OUT_DIR / "experiment_summary.json"
@@ -1669,6 +1641,46 @@ print("\nREQUIREMENT CHECKS")
 for k, v in checks.items():
     print(k, ":", v)
 
+
+def save_training_noise_allocation_diagnostics():
+    if not IS_ROI or not NOISE_ALLOCATION_MAPS:
+        return
+
+    map_rows = []
+    summary_rows = []
+    for layer_name, summed_map in NOISE_ALLOCATION_MAPS.items():
+        count = int(NOISE_ALLOCATION_COUNTS.get(layer_name, 1))
+        matrix = (summed_map / max(count, 1)).detach().cpu().numpy().astype(float)
+        h, w = matrix.shape
+        summary_rows.append({
+            "layer": layer_name,
+            "kernel_height": int(h),
+            "kernel_width": int(w),
+            "scale_mean": float(matrix.mean()),
+            "scale_std": float(matrix.std()),
+            "scale_min": float(matrix.min()),
+            "scale_max": float(matrix.max()),
+            "scale_rms_of_mean_map": float(np.sqrt(np.mean(np.square(matrix)))),
+            "num_training_updates_averaged": count,
+            "snapshot": "mean scale map across actual training updates for this parameter tensor",
+            "coordinate_interpretation": "convolution weight tensor gradient coordinates; parameter-space sensitivity allocation",
+        })
+        for kh in range(h):
+            for kw in range(w):
+                map_rows.append({
+                    "layer": layer_name,
+                    "kernel_h_index": kh,
+                    "kernel_w_index": kw,
+                    "noise_scale_relative_to_base": float(matrix[kh, kw]),
+                    "snapshot": "mean scale map across actual training updates for this parameter tensor",
+                })
+
+    pd.DataFrame(map_rows).to_csv(OUT_DIR / "gradient_noise_kernel_maps.csv", index=False)
+    pd.DataFrame(summary_rows).to_csv(OUT_DIR / "gradient_noise_kernel_map_summary.csv", index=False)
+
+
+save_training_noise_allocation_diagnostics()
+
 zip_path = None
 if SAVE_ZIP:
     zip_path = shutil.make_archive(str(OUT_DIR), "zip", root_dir=OUT_DIR)
@@ -1678,8 +1690,8 @@ print("SAVED FILES")
 print("============================================================")
 print("Output folder:", OUT_DIR)
 print("Training log:", TRAIN_LOG_PATH)
-if IS_DP:
-    print("Privacy log:", PRIVACY_LOG_PATH)
+if IS_PERTURBATION:
+    print("Perturbation diagnostics:", PERTURBATION_LOG_PATH)
 print("Final metrics:", FINAL_METRICS_PATH)
 print("Best val model:", BEST_VAL_MODEL_PATH)
 print("Best target model:", BEST_TARGET_MODEL_PATH if BEST_TARGET_MODEL_PATH.exists() else "not created")
